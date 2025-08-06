@@ -337,5 +337,178 @@ TEST_F(AutoCommissionerTest, NextStageConfigureTCAcknowledgments)
 
     EXPECT_EQ(nextStage, kSendPAICertificateRequest);
 }
+TEST_F(AutoCommissionerTest, IcdRegistrationFailsOnMissingPiecesOrBadKeySize)
+{
+    // Always use a non-Ignore strategy so the ICD block is considered when key is present.
+    mParams.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete);
+
+    // 1) Wrong key length -> INVALID_ARGUMENT
+    {
+        CommissioningParameters p{};
+        p.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete);
+        uint8_t short_key[Crypto::kAES_CCM128_Key_Length - 1] = {};
+        p.SetICDSymmetricKey(ByteSpan{ short_key, sizeof(short_key) });
+        ASSERT_EQ(mCommissioner.SetCommissioningParameters(p), CHIP_ERROR_INVALID_ARGUMENT);
+    }
+
+    // 2) Strategy set but key missing -> NO_ERROR (ICD validation skipped; nothing applied)
+    {
+        CommissioningParameters p{};
+        p.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete);
+        ASSERT_EQ(mCommissioner.SetCommissioningParameters(p), CHIP_NO_ERROR);
+        const auto & out = mCommissioner.GetCommissioningParameters();
+        ASSERT_FALSE(out.GetICDSymmetricKey().HasValue());
+        ASSERT_FALSE(out.GetICDCheckInNodeId().HasValue());
+        ASSERT_FALSE(out.GetICDMonitoredSubject().HasValue());
+        ASSERT_FALSE(out.GetICDClientType().HasValue());
+    }
+
+    // 3) Key present but missing check-in node id -> INVALID_ARGUMENT
+    {
+        CommissioningParameters p{};
+        p.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete);
+        uint8_t ok_key[Crypto::kAES_CCM128_Key_Length] = {};
+        p.SetICDSymmetricKey(ByteSpan{ ok_key, sizeof(ok_key) });
+        ASSERT_EQ(mCommissioner.SetCommissioningParameters(p), CHIP_ERROR_INVALID_ARGUMENT);
+    }
+
+    // 4) Add check-in node id; still missing monitored subject -> INVALID_ARGUMENT
+    {
+        CommissioningParameters p{};
+        p.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete);
+        uint8_t ok_key[Crypto::kAES_CCM128_Key_Length] = {};
+        p.SetICDSymmetricKey(ByteSpan{ ok_key, sizeof(ok_key) });
+        p.SetICDCheckInNodeId(NodeId{ 42 });
+        ASSERT_EQ(mCommissioner.SetCommissioningParameters(p), CHIP_ERROR_INVALID_ARGUMENT);
+    }
+
+    // 5) Add monitored subject; still missing client type -> INVALID_ARGUMENT
+    {
+        CommissioningParameters p{};
+        p.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete);
+        uint8_t ok_key[Crypto::kAES_CCM128_Key_Length] = {};
+        p.SetICDSymmetricKey(ByteSpan{ ok_key, sizeof(ok_key) });
+        p.SetICDCheckInNodeId(NodeId{ 42 });
+        p.SetICDMonitoredSubject(uint64_t{ 7 });
+        ASSERT_EQ(mCommissioner.SetCommissioningParameters(p), CHIP_ERROR_INVALID_ARGUMENT);
+    }
+}
+
+TEST_F(AutoCommissionerTest, SetCommissioningParametersIsNoOpWhenPassingOwnParams)
+{
+    // First set some value so we know params are initialized
+    mParams.SetCountryCode("US"_span);
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(mParams), CHIP_NO_ERROR);
+
+    // Now pass the *same* reference back (address equality check)
+    const CommissioningParameters & same = mCommissioner.GetCommissioningParameters();
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(same), CHIP_NO_ERROR);
+
+    // Stays the same and valid
+    auto again = mCommissioner.GetCommissioningParameters();
+    ASSERT_TRUE(again.GetCountryCode().HasValue());
+    ASSERT_TRUE(again.GetCountryCode().Value().data_equal("US"_span));
+}
+
+TEST_F(AutoCommissionerTest, CopiesValidThreadDataset)
+{
+    uint8_t ds[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    mParams.SetThreadOperationalDataset(ByteSpan{ ds, sizeof(ds) });
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(mParams), CHIP_NO_ERROR);
+
+    auto p = mCommissioner.GetCommissioningParameters();
+    ASSERT_TRUE(p.GetThreadOperationalDataset().HasValue());
+    ASSERT_EQ(p.GetThreadOperationalDataset().Value().size(), sizeof(ds));
+    ASSERT_TRUE(p.GetThreadOperationalDataset().Value().data_equal(ByteSpan{ ds, sizeof(ds) }));
+}
+
+TEST_F(AutoCommissionerTest, CopiesValidWifiCredentials)
+{
+    const uint8_t ssid_bytes[] = { 'A', 'P' };
+    const uint8_t pass_bytes[] = { '1', '2', '3', '4' };
+    mParams.SetWiFiCredentials(WiFiCredentials{ ByteSpan{ ssid_bytes }, ByteSpan{ pass_bytes } });
+
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(mParams), CHIP_NO_ERROR);
+    auto p = mCommissioner.GetCommissioningParameters();
+    ASSERT_TRUE(p.GetWiFiCredentials().HasValue());
+    auto creds = p.GetWiFiCredentials().Value();
+    ASSERT_TRUE(creds.ssid.data_equal(ByteSpan{ ssid_bytes }));
+    ASSERT_TRUE(creds.credentials.data_equal(ByteSpan{ pass_bytes }));
+}
+
+TEST_F(AutoCommissionerTest, AcceptsTwoCharCountryCode)
+{
+    mParams.SetCountryCode("AM"_span);
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(mParams), CHIP_NO_ERROR);
+
+    auto p = mCommissioner.GetCommissioningParameters();
+    ASSERT_TRUE(p.GetCountryCode().HasValue());
+    ASSERT_TRUE(p.GetCountryCode().Value().data_equal("AM"_span));
+}
+
+TEST_F(AutoCommissionerTest, UsesProvidedNoncesOrGeneratesRandomWhenMissing)
+{
+    // Provided attestation/CSR nonces of exact size are accepted
+    std::unique_ptr<uint8_t[]> att(new uint8_t[kAttestationNonceLength]);
+    std::unique_ptr<uint8_t[]> csr(new uint8_t[kCSRNonceLength]);
+    std::memset(att.get(), 0xAB, kAttestationNonceLength);
+    std::memset(csr.get(), 0xCD, kCSRNonceLength);
+    mParams.SetAttestationNonce(ByteSpan{ att.get(), kAttestationNonceLength });
+    mParams.SetCSRNonce(ByteSpan{ csr.get(), kCSRNonceLength });
+
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(mParams), CHIP_NO_ERROR);
+    auto p1 = mCommissioner.GetCommissioningParameters();
+    ASSERT_TRUE(p1.GetAttestationNonce().HasValue());
+    ASSERT_EQ(p1.GetAttestationNonce().Value().size(), kAttestationNonceLength);
+    ASSERT_TRUE(p1.GetAttestationNonce().Value().data_equal(ByteSpan{ att.get(), kAttestationNonceLength }));
+
+    ASSERT_TRUE(p1.GetCSRNonce().HasValue());
+    ASSERT_EQ(p1.GetCSRNonce().Value().size(), kCSRNonceLength);
+    ASSERT_TRUE(p1.GetCSRNonce().Value().data_equal(ByteSpan{ csr.get(), kCSRNonceLength }));
+
+    // Clear nonces: AutoCommissioner should generate random ones and set them back
+    CommissioningParameters empty;
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(empty), CHIP_NO_ERROR);
+    auto p2 = mCommissioner.GetCommissioningParameters();
+    ASSERT_TRUE(p2.GetAttestationNonce().HasValue());
+    ASSERT_EQ(p2.GetAttestationNonce().Value().size(), kAttestationNonceLength);
+    ASSERT_TRUE(p2.GetCSRNonce().HasValue());
+    ASSERT_EQ(p2.GetCSRNonce().Value().size(), kCSRNonceLength);
+}
+
+TEST_F(AutoCommissionerTest, TimeZoneNameTooLongIsCleared)
+{
+    app::Clusters::TimeSynchronization::Structs::TimeZoneStruct::Type tz{};
+    tz.offset  = 0;
+    tz.validAt = epochJanFirst2000;
+
+    // Make a clearly-too-long name (well beyond any reasonable internal cap).
+    std::vector<char> long_name(4096, 'X');
+    tz.name.SetValue(CharSpan{ long_name.data(), long_name.size() });
+
+    app::DataModel::List<app::Clusters::TimeSynchronization::Structs::TimeZoneStruct::Type> list(&tz, 1);
+    mParams.SetTimeZone(list);
+
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(mParams), CHIP_NO_ERROR);
+
+    auto p = mCommissioner.GetCommissioningParameters();
+    ASSERT_TRUE(p.GetTimeZone().HasValue());
+    ASSERT_EQ(p.GetTimeZone().Value().size(), size_t{ 1 });
+    // Name must be cleared when longer than the internal kMaxTimeZoneNameLen.
+    ASSERT_FALSE(p.GetTimeZone().Value()[0].name.HasValue());
+}
+
+TEST_F(AutoCommissionerTest, OversizedDefaultNtpIsIgnoredAndNotSet)
+{
+    // Make an NTP string far beyond the internal limit so it will be ignored.
+    std::vector<char> long_ntp(4096, 'n');
+    mParams.SetDefaultNTP(chip::app::DataModel::MakeNullable(CharSpan{ long_ntp.data(), long_ntp.size() }));
+
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(mParams), CHIP_NO_ERROR);
+
+    auto p = mCommissioner.GetCommissioningParameters();
+    // Too-long NTP should NOT be set (code only sets when size <= kMaxDefaultNtpSize).
+    ASSERT_FALSE(p.GetDefaultNTP().HasValue());
+}
 
 } // namespace
