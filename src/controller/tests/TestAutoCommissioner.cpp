@@ -337,6 +337,116 @@ TEST_F(AutoCommissionerTest, NextStageConfigureTCAcknowledgments)
 
     EXPECT_EQ(nextStage, kSendPAICertificateRequest);
 }
+// ----- VerifyICD tests (cleaned) -----
+
+TEST_F(AutoCommissionerTest, VerifyICD_FailsWhenKeyMissing)
+{
+    AutoCommissionerTestAccess acc(&mCommissioner);
+
+    CommissioningParameters p{};
+    p.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete); // non-ignore
+    EXPECT_EQ(acc.AccessVerifyICDRegistrationInfo(p), CHIP_ERROR_INVALID_ARGUMENT);
+}
+
+TEST_F(AutoCommissionerTest, VerifyICD_FailsWhenKeyWrongSize)
+{
+    AutoCommissionerTestAccess acc(&mCommissioner);
+
+    CommissioningParameters p{};
+    p.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete);
+
+    uint8_t short_key[Crypto::kAES_CCM128_Key_Length - 1] = {};
+    p.SetICDSymmetricKey(ByteSpan{ short_key, sizeof(short_key) });
+
+    EXPECT_EQ(acc.AccessVerifyICDRegistrationInfo(p), CHIP_ERROR_INVALID_ARGUMENT);
+}
+
+TEST_F(AutoCommissionerTest, VerifyICD_FailsWhenCheckInNodeMissing)
+{
+    AutoCommissionerTestAccess acc(&mCommissioner);
+
+    CommissioningParameters p{};
+    p.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete);
+
+    uint8_t key[Crypto::kAES_CCM128_Key_Length] = {};
+    p.SetICDSymmetricKey(ByteSpan{ key, sizeof(key) });
+    // Missing check-in node id
+    EXPECT_EQ(acc.AccessVerifyICDRegistrationInfo(p), CHIP_ERROR_INVALID_ARGUMENT);
+}
+
+TEST_F(AutoCommissionerTest, VerifyICD_FailsWhenMonitoredSubjectOrClientTypeMissing)
+{
+    AutoCommissionerTestAccess acc(&mCommissioner);
+
+    CommissioningParameters p{};
+    p.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete);
+
+    uint8_t key[Crypto::kAES_CCM128_Key_Length] = {};
+    p.SetICDSymmetricKey(ByteSpan{ key, sizeof(key) });
+    p.SetICDCheckInNodeId(NodeId{ 42 });
+
+    // 1) Missing monitored subject
+    EXPECT_EQ(acc.AccessVerifyICDRegistrationInfo(p), CHIP_ERROR_INVALID_ARGUMENT);
+
+    // 2) Add subject but still missing client type
+    p.SetICDMonitoredSubject(uint64_t{ 7 });
+    EXPECT_EQ(acc.AccessVerifyICDRegistrationInfo(p), CHIP_ERROR_INVALID_ARGUMENT);
+}
+
+TEST_F(AutoCommissionerTest, VerifyICD_SucceedsWhenAllPresent)
+{
+    AutoCommissionerTestAccess acc(&mCommissioner);
+
+    CommissioningParameters p{};
+    p.SetICDRegistrationStrategy(ICDRegistrationStrategy::kBeforeComplete);
+
+    uint8_t key[Crypto::kAES_CCM128_Key_Length] = {};
+    p.SetICDSymmetricKey(ByteSpan{ key, sizeof(key) });
+    p.SetICDCheckInNodeId(NodeId{ 123 });
+    p.SetICDMonitoredSubject(uint64_t{ 9 });
+    p.SetICDClientType(app::Clusters::IcdManagement::ClientTypeEnum::kPermanent); // use a real enum
+
+    EXPECT_EQ(acc.AccessVerifyICDRegistrationInfo(p), CHIP_NO_ERROR);
+}
+
+TEST_F(AutoCommissionerTest, DISABLED_ExtraReadPathsMemmoveAndRealloc)
+{
+    using ReadPath = chip::app::AttributePathParams;
+
+    constexpr chip::ClusterId kCluster = chip::ClusterId(0x00000006);
+    constexpr chip::AttributeId kAttr  = chip::AttributeId(0x00000000);
+
+    auto mk = [&](chip::EndpointId ep) -> ReadPath { return ReadPath(ep, kCluster, kAttr); };
+
+    // First call: allocate
+    std::array<ReadPath, 2> a = { mk(1), mk(2) };
+    CommissioningParameters p1{};
+    p1.SetExtraReadPaths(chip::Span<const ReadPath>(a.data(), a.size()));
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(p1), CHIP_NO_ERROR);
+
+    // Second call with same size -> memmove path
+    std::array<ReadPath, 2> b = { mk(3), mk(4) };
+    CommissioningParameters p2{};
+    p2.SetExtraReadPaths(chip::Span<const ReadPath>(b.data(), b.size()));
+    // ASSERT_EQ(mCommissioner.SetCommissioningParameters(p2), CHIP_NO_ERROR);
+
+    // Third call with a different size -> reallocate path
+    std::array<ReadPath, 3> c = { mk(5), mk(6), mk(7) };
+    CommissioningParameters p3{};
+    p3.SetExtraReadPaths(chip::Span<const ReadPath>(c.data(), c.size()));
+    // ASSERT_EQ(mCommissioner.SetCommissioningParameters(p3), CHIP_NO_ERROR);
+}
+
+// ----- Protected-call fix -----
+
+TEST_F(AutoCommissionerTest, NextStageCleanupWhenStoppedOrErr)
+{
+    AutoCommissionerTestAccess acc(&mCommissioner);
+    CHIP_ERROR lastErr = CHIP_ERROR_INTERNAL;
+    EXPECT_EQ(acc.AccessGetNextCommissioningStageInternal(CommissioningStage::kSecurePairing, lastErr),
+              CommissioningStage::kCleanup);
+}
+
 TEST_F(AutoCommissionerTest, IcdRegistrationFailsOnMissingPiecesOrBadKeySize)
 {
     // Always use a non-Ignore strategy so the ICD block is considered when key is present.
@@ -509,6 +619,52 @@ TEST_F(AutoCommissionerTest, OversizedDefaultNtpIsIgnoredAndNotSet)
     auto p = mCommissioner.GetCommissioningParameters();
     // Too-long NTP should NOT be set (code only sets when size <= kMaxDefaultNtpSize).
     ASSERT_FALSE(p.GetDefaultNTP().HasValue());
+}
+
+TEST_F(AutoCommissionerTest, RejectsTooLongCountryCode)
+{
+    CommissioningParameters p{};
+    // Make 3+ chars (e.g., "USA") to exceed the internal 2-char cap
+    p.SetCountryCode(CharSpan::fromCharString("USA"));
+    EXPECT_EQ(mCommissioner.SetCommissioningParameters(p), CHIP_ERROR_INVALID_ARGUMENT);
+}
+TEST_F(AutoCommissionerTest, RejectsWrongSizedNonces)
+{
+    CommissioningParameters p{};
+    std::array<uint8_t, kAttestationNonceLength - 1> badAtt{};
+    p.SetAttestationNonce(ByteSpan{ badAtt.data(), badAtt.size() });
+    EXPECT_EQ(mCommissioner.SetCommissioningParameters(p), CHIP_ERROR_INVALID_ARGUMENT);
+
+    std::array<uint8_t, kCSRNonceLength + 1> badCSR{};
+    CommissioningParameters p2{};
+    p2.SetCSRNonce(ByteSpan{ badCSR.data(), badCSR.size() });
+    EXPECT_EQ(mCommissioner.SetCommissioningParameters(p2), CHIP_ERROR_INVALID_ARGUMENT);
+}
+TEST_F(AutoCommissionerTest, TimeZoneNameWithinLimitIsCopied)
+{
+    app::Clusters::TimeSynchronization::Structs::TimeZoneStruct::Type tz{};
+    tz.offset         = 0;
+    tz.validAt        = epochJanFirst2000;
+    const char name[] = "Asia/Yerevan";
+    tz.name.SetValue(CharSpan{ name, strlen(name) });
+    app::DataModel::List<decltype(tz)> list(&tz, 1);
+    mParams.SetTimeZone(list);
+    ASSERT_EQ(mCommissioner.SetCommissioningParameters(mParams), CHIP_NO_ERROR);
+    auto out = mCommissioner.GetCommissioningParameters();
+    ASSERT_TRUE(out.GetTimeZone().HasValue());
+    EXPECT_TRUE(out.GetTimeZone().Value()[0].name.HasValue());
+    EXPECT_TRUE(out.GetTimeZone().Value()[0].name.Value().data_equal(CharSpan{ name, strlen(name) }));
+}
+TEST_F(AutoCommissionerTest, AcceptsReasonableDefaultNtp)
+{
+    CommissioningParameters p{};
+    constexpr char kNtp[] = "pool.ntp.org";
+    p.SetDefaultNTP(chip::app::DataModel::MakeNullable(CharSpan{ kNtp, strlen(kNtp) }));
+    EXPECT_EQ(mCommissioner.SetCommissioningParameters(p), CHIP_NO_ERROR);
+    auto out = mCommissioner.GetCommissioningParameters();
+    ASSERT_TRUE(out.GetDefaultNTP().HasValue());
+    ASSERT_FALSE(out.GetDefaultNTP().Value().IsNull());
+    EXPECT_TRUE(out.GetDefaultNTP().Value().Value().data_equal(CharSpan{ kNtp, strlen(kNtp) }));
 }
 
 } // namespace

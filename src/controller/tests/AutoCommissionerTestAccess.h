@@ -33,24 +33,30 @@
 namespace chip {
 
 namespace Test {
-// Provides access to private/protected members of AutoCommissioner class for testing
-class AutoCommissionerTestAccess
-{
-public:
-    AutoCommissionerTestAccess() = delete;
-    AutoCommissionerTestAccess(Controller::AutoCommissioner * commissioner) : mCommissioner(commissioner) {}
+    // Provides access to private/protected members of AutoCommissioner class for testing
+    class AutoCommissionerTestAccess {
+    public:
+        AutoCommissionerTestAccess() = delete;
+        AutoCommissionerTestAccess(Controller::AutoCommissioner * commissioner)
+            : mCommissioner(commissioner)
+        {
+        }
 
-    Controller::CommissioningStage AccessGetNextCommissioningStageInternal(Controller::CommissioningStage currentStage,
-                                                                           CHIP_ERROR & lastErr)
-    {
-        return mCommissioner->GetNextCommissioningStageInternal(currentStage, lastErr);
-    }
-    void SetBreadcrumb(uint64_t value) { mCommissioner->mDeviceCommissioningInfo.general.breadcrumb = value; }
-    void SetUTCRequirements(bool requiresUTC) { mCommissioner->mDeviceCommissioningInfo.requiresUTC = requiresUTC; }
+        Controller::CommissioningStage AccessGetNextCommissioningStageInternal(Controller::CommissioningStage currentStage,
+            CHIP_ERROR & lastErr)
+        {
+            return mCommissioner->GetNextCommissioningStageInternal(currentStage, lastErr);
+        }
+        CHIP_ERROR AccessVerifyICDRegistrationInfo(const Controller::CommissioningParameters & p)
+        {
+            return mCommissioner->VerifyICDRegistrationInfo(p);
+        }
+        void SetBreadcrumb(uint64_t value) { mCommissioner->mDeviceCommissioningInfo.general.breadcrumb = value; }
+        void SetUTCRequirements(bool requiresUTC) { mCommissioner->mDeviceCommissioningInfo.requiresUTC = requiresUTC; }
 
-private:
-    Controller::AutoCommissioner * mCommissioner = nullptr;
-};
+    private:
+        Controller::AutoCommissioner * mCommissioner = nullptr;
+    };
 
 } // namespace Test
 } // namespace chip
