@@ -618,7 +618,32 @@ public:
     // as no consolidation of internally read and extra paths provided here will be performed.
     CommissioningParameters & SetExtraReadPaths(Span<const app::AttributePathParams> paths)
     {
-        mExtraReadPaths = paths;
+        bool aliases = false;
+        if (!mExtraReadPaths.empty() && paths.size() > 0)
+        {
+            const auto* in_start = paths.data();
+            const auto* in_end   = in_start + paths.size();
+            const auto* buf_start = mExtraReadPaths.data();
+            const auto* buf_end   = buf_start + mExtraReadPaths.size();
+            // Aliasing if input region overlaps internal buffer region
+            if ((in_start >= buf_start && in_start < buf_end) ||
+                (in_end > buf_start && in_end <= buf_end) ||
+                (in_start <= buf_start && in_end >= buf_end))
+            {
+                aliases = true;
+            }
+        }
+    
+        if (aliases)
+        {
+            // Copy to temp buffer before modifying internal buffer
+            std::vector<app::AttributePathParams> temp(paths.begin(), paths.end());
+            mExtraReadPaths = temp;
+        }
+        else
+        {
+            mExtraReadPaths.assign(paths.begin(), paths.end());
+        }
         return *this;
     }
 
